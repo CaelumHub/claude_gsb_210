@@ -32,23 +32,34 @@ def stream_stft(path: str, nfft: int = 2048, hop: int = 512,
     """Yield (magnitude-spectrum, sample-rate) frames, streamed from disk.
 
     Only ``nfft//2+1`` positive bins are returned.  A carry buffer makes the
-    frames seamless across the fixed-size read chunks."""
+    frames seamless across the fixed-size read chunks.  The signal is
+    centre-padded with ``nfft//2`` zeros on *both* ends (librosa
+    ``center=True`` semantics): frame ``i`` is centred at sample ``i*hop``
+    and the frames cover the whole signal including its tail, so the frame
+    grid does not depend on where the file happens to end."""
     w = dsp.window(win, nfft)
+    bins = nfft // 2 + 1
     carry: List[float] = [0.0] * (nfft // 2)  # centre-pad once at the start
     with audio_io.WavReader(path) as r:
         sr = r.sr
         while True:
             chunk = r.read_chunk(1 << 16)
             if chunk is None:
-                break
-            carry.extend(audio_io.to_mono(chunk))
+                # Centre-pad the tail as well, then drain the carry buffer so
+                # the final samples are covered by frames of their own.
+                carry.extend([0.0] * (nfft // 2))
+                done = True
+            else:
+                carry.extend(audio_io.to_mono(chunk))
+                done = False
             while len(carry) >= nfft:
                 seg = carry[:nfft]
                 frame = dsp.fft([seg[k] * w[k] for k in range(nfft)])
-                bins = nfft // 2 + 1
                 mag = [abs(frame[k]) for k in range(bins)]
                 yield mag, sr
                 carry = carry[hop:]
+            if done:
+                break
 
 
 def stream_windows(path: str, win_len: int = 2048,

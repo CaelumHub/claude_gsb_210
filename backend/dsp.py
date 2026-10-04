@@ -16,7 +16,7 @@ The module is organised as layers:
   5.  Audio metrics               (RMS, ZCR, spectral centroid, rolloff, flux…)
   6.  Biquad filters              (RBJ cookbook, used by the EQ & separation)
   7.  Pitch detection             (FFT autocorrelation + the YIN algorithm)
-  8.  Onset / beat / tempo        (spectral flux + autocorrelation beat tracker)
+  8.  Onset / beat / tempo        (spectral flux, autocorrelation tempo, DP beat tracking)
   9.  Chroma                      (fold STFT energy into pitch classes)
  10.  Utilities                   (dB conversion, resampling, smoothing)
 
@@ -708,63 +708,151 @@ def local_maxima(x: Sequence[float]) -> List[int]:
 
 def estimate_tempo(onset_env: Sequence[float], frame_rate: float,
                    min_bpm: float = 40.0, max_bpm: float = 240.0) -> float:
-    """Estimate tempo (BPM) via autocorrelation of the onset envelope."""
+    """Estimate tempo (BPM) via autocorrelation of the onset envelope.
+
+    The envelope is mean-subtracted and the autocorrelation is normalised by
+    the number of overlapping terms at each lag, so the estimate does not
+    drift with the length of the excerpt.  A log-Gaussian prior centred on
+    120 BPM (one-octave std, as in librosa/Ellis) is applied to resolve the
+    metrical-level ambiguity of autocorrelation — a kick/snare backbeat
+    makes 2x the beat period correlate up to twice as strongly as the beat
+    period itself.  Among the remaining local maxima, the *smallest* lag
+    within 40% of the strongest peak is then chosen, which avoids locking
+    onto 2x/3x the true beat period of genuinely fast music.  A parabolic
+    interpolation around the chosen lag gives sub-frame tempo resolution.
+    """
     n = len(onset_env)
-    if n < 8:
+    if n < 8 or max(onset_env) <= 1e-9:
         return 120.0
-    acorr = autocorrelation(onset_env)
+    mean = sum(onset_env) / n
+    env = [v - mean for v in onset_env]
+    acorr = autocorrelation(env)
     min_lag = max(1, int(frame_rate * 60.0 / max_bpm))
-    max_lag = min(n - 1, int(frame_rate * 60.0 / min_bpm))
+    # Require at least two periods of signal for a lag to be meaningful.
+    max_lag = min(n // 2, int(frame_rate * 60.0 / min_bpm))
     if min_lag >= max_lag:
         return 120.0
-    best_lag, best_val = min_lag, -1e18
+    # Unbiased normalisation (divide by the overlap count, so that long lags
+    # are not unfairly damped in short excerpts) x the tempo prior.
+    norm = []
     for lag in range(min_lag, max_lag + 1):
-        if acorr[lag] > best_val:
-            best_val, best_lag = acorr[lag], lag
+        bpm = 60.0 * frame_rate / lag
+        prior = math.exp(-0.5 * (math.log2(bpm / 120.0)) ** 2)
+        norm.append(acorr[lag] / (n - lag) * prior)
+
+    peaks = [k for k in range(1, len(norm) - 1)
+             if norm[k] > 0.0 and norm[k] >= norm[k - 1] and norm[k] > norm[k + 1]]
+    if not peaks:
+        best_k = max(range(len(norm)), key=lambda k: norm[k])
+    else:
+        best_val = max(norm[k] for k in peaks)
+        strong = [k for k in peaks if norm[k] >= 0.4 * best_val]
+        best_k = min(strong)
+    best_lag = float(min_lag + best_k)
+    # Parabolic interpolation around the peak for sub-frame resolution.
+    if 0 < best_k < len(norm) - 1:
+        y0, y1, y2 = norm[best_k - 1], norm[best_k], norm[best_k + 1]
+        denom = y0 - 2.0 * y1 + y2
+        if abs(denom) > 1e-12:
+            delta = 0.5 * (y0 - y2) / denom
+            if abs(delta) < 1.0:
+                best_lag += delta
+    # Keep the (possibly interpolated) lag inside the scanned range.
+    best_lag = min(float(max_lag), max(float(min_lag), best_lag))
     return 60.0 * frame_rate / best_lag
 
 
 def smooth(x: Sequence[float], width: int = 3) -> List[float]:
-    """Moving-average smoothing of a 1-D sequence."""
-    if width < 1:
-        return list(x)
+    """Centred moving-average smoothing of a 1-D sequence.
+
+    The window is centred on each output sample (for even ``width`` it leans
+    half a sample to the left) and shrinks at the edges instead of padding,
+    so smoothing never shifts features along the axis."""
     n = len(x)
-    out = []
+    if width < 2 or n == 0:
+        return list(x)
     half = width // 2
-    acc = sum(x[:width])
+    # Prefix sums give O(1) window sums -> O(n) overall.
+    prefix = [0.0] * (n + 1)
+    acc = 0.0
+    for i, v in enumerate(x):
+        acc += v
+        prefix[i + 1] = acc
+    out = []
     for i in range(n):
-        out.append(acc / width)
-        if i - half >= 0 and i + half + 1 < n:
-            acc += x[i + half + 1] - x[i - half]
+        lo = i - half
+        hi = lo + width
+        if lo < 0:
+            lo = 0
+        if hi > n:
+            hi = n
+        out.append((prefix[hi] - prefix[lo]) / (hi - lo))
     return out
 
 
-def detect_beats(onset_env: Sequence[float], frame_rate: float, tempo: Optional[float] = None) -> List[float]:
-    """Beat times (s) via onset-envelope peak picking guided by the tempo."""
+def detect_beats(onset_env: Sequence[float], frame_rate: float,
+                 tempo: Optional[float] = None, tightness: float = 100.0) -> List[float]:
+    """Beat times (s) via dynamic-programming beat tracking (Ellis et al.).
+
+    Rather than greedily picking peaks left-to-right — which anchors the
+    whole beat grid on the first strong onset, so the grid phase shifts
+    whenever the audio is trimmed — this finds the *globally* optimal beat
+    sequence: every beat scores the onset strength at its own position, and
+    a log-period transition penalty keeps successive inter-beat intervals
+    close to the estimated tempo period.  The grid therefore aligns itself
+    to where the onset energy actually is and is invariant to where the
+    excerpt starts or ends.
+    """
     n = len(onset_env)
     if n == 0:
         return []
     if tempo is None:
         tempo = estimate_tempo(onset_env, frame_rate)
-    period = max(1, int(round(frame_rate * 60.0 / tempo)))
-    sm = smooth(onset_env, max(3, period // 2))
-    peaks = local_maxima(sm)
-    if not peaks:
+    period = max(2.0, frame_rate * 60.0 / max(tempo, 1e-6))  # frames per beat
+
+    # Unit-max local score so the DP behaves the same at any signal level.
+    mx = max(onset_env)
+    if mx <= 1e-12:
         return []
-    # Threshold relative to local average.
-    mean = sum(sm) / max(1, n)
-    thresh = mean * 1.3
-    candidates = [p for p in peaks if sm[p] > thresh]
-    if not candidates:
-        candidates = peaks
-    # Greedy pick with a minimum spacing of half a beat period.
+    local = [v / mx for v in onset_env]
+
+    # Allowed predecessor distances: [period/2, 2*period] frames back, with a
+    # log-domain penalty that favours intervals near the tempo period.
+    lo = max(1, int(round(period * 0.5)))
+    hi = max(lo, int(round(period * 2.0)))
+    penalty = [0.0] * (hi + 1)
+    for d in range(lo, hi + 1):
+        r = math.log(d / period)
+        penalty[d] = -tightness * r * r
+
+    score = [0.0] * n
+    back = [-1] * n
+    for i in range(n):
+        best = 0.0  # 0 => this frame may start a new beat sequence
+        best_d = -1
+        d_max = hi if hi <= i else i
+        for d in range(lo, d_max + 1):
+            val = score[i - d] + penalty[d]
+            if val > best:
+                best = val
+                best_d = d
+        score[i] = local[i] + best
+        back[i] = i - best_d if best_d > 0 else -1
+
+    # The final beat is the best-scoring frame within the last beat period.
+    tail = max(1, int(round(period)))
+    start = max(0, n - tail)
+    end = start
+    for i in range(start + 1, n):
+        if score[i] > score[end]:
+            end = i
+
     beats = []
-    last = -10 ** 9
-    min_gap = max(1, period // 2)
-    for p in candidates:
-        if p - last >= min_gap and sm[p] > 0:
-            beats.append(p)
-            last = p
+    i = end
+    while i >= 0:
+        beats.append(i)
+        i = back[i]
+    beats.reverse()
     return [b / frame_rate for b in beats]
 
 
