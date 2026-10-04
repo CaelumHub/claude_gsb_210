@@ -32,11 +32,20 @@ def stream_stft(path: str, nfft: int = 2048, hop: int = 512,
     """Yield (magnitude-spectrum, sample-rate) frames, streamed from disk.
 
     Only ``nfft//2+1`` positive bins are returned.  A carry buffer makes the
-    frames seamless across the fixed-size read chunks."""
+    frames seamless across the fixed-size read chunks, and the start is
+    centre-padded by ``nfft//2`` zeros — exactly like ``center=True`` STFT —
+    so frame *i* is centred on sample ``i*hop``.  Tail frames are emitted with
+    zero padding as well: every crop of the same audio therefore produces the
+    same frame grid shifted by its start offset, and analyses depending on
+    frame times do not change with clip length or crop position.
+    """
     w = dsp.window(win, nfft)
-    carry: List[float] = [0.0] * (nfft // 2)  # centre-pad once at the start
     with audio_io.WavReader(path) as r:
         sr = r.sr
+        nframes = r.nframes
+        carry: List[float] = [0.0] * (nfft // 2)  # centre-pad once at the start
+        pos = -nfft // 2  # audio sample under carry[0]
+        bins = nfft // 2 + 1
         while True:
             chunk = r.read_chunk(1 << 16)
             if chunk is None:
@@ -45,10 +54,21 @@ def stream_stft(path: str, nfft: int = 2048, hop: int = 512,
             while len(carry) >= nfft:
                 seg = carry[:nfft]
                 frame = dsp.fft([seg[k] * w[k] for k in range(nfft)])
-                bins = nfft // 2 + 1
-                mag = [abs(frame[k]) for k in range(bins)]
-                yield mag, sr
+                yield [abs(frame[k]) for k in range(bins)], sr
                 carry = carry[hop:]
+                pos += hop
+        # Flush remaining frames, zero-padding each one; emit a frame while
+        # its window still overlaps real audio (pos < nframes).  Together
+        # with the head pad this yields exactly 1 + nframes//hop frames,
+        # matching centre=True STFT for any file or crop length.
+        while pos < nframes:
+            if len(carry) < nfft:
+                carry.extend([0.0] * (nfft - len(carry)))
+            seg = carry[:nfft]
+            frame = dsp.fft([seg[k] * w[k] for k in range(nfft)])
+            yield [abs(frame[k]) for k in range(bins)], sr
+            carry = carry[hop:]
+            pos += hop
 
 
 def stream_windows(path: str, win_len: int = 2048,
@@ -166,7 +186,18 @@ def analyze_spectral(path: str, nfft: int = 2048, hop: int = 512,
         rms_series.append(dsp.rms(frame))
         zcr_series.append(dsp.zero_crossing_rate(frame))
 
-    times = [i * hop / sr for i in range(frame_idx)]
+    # STFT frames are centre-padded and tail-flushed, so there can be a few
+    # more of them than unpadded time-domain windows; align every series to
+    # the common length so consumers can index them by the same time base.
+    n_common = min(frame_idx, len(rms_series), len(zcr_series))
+    centroids = centroids[:n_common]
+    rolloffs = rolloffs[:n_common]
+    flatness = flatness[:n_common]
+    flux = flux[:n_common]
+    rms_series = rms_series[:n_common]
+    zcr_series = zcr_series[:n_common]
+    times = [i * hop / sr for i in range(n_common)]
+    frame_idx = n_common
     return {
         "sr": sr,
         "times": times,
@@ -231,34 +262,51 @@ def analyze_pitch(path: str, win_len: int = 2048, hop: int = 512,
 
 def analyze_beats(path: str, nfft: int = 2048, hop: int = 512,
                   min_bpm: float = 40.0, max_bpm: float = 240.0) -> Dict:
-    """Tempo (BPM) and beat times from a spectral-flux onset envelope."""
+    """Tempo (BPM) and beat times from a spectral-flux onset envelope.
+
+    Tempo and phase are chosen by scoring an event grid against the onset
+    peaks, and each grid line is snapped to the nearest real accent; the
+    pipeline uses only zero-phase filtering, so beat times are aligned with
+    the physical onsets and are invariant under trimming or shifting the
+    crop window (see :func:`dsp.track_beats`).
+    """
     onset: List[float] = []
     prev = None
     sr = 44100
     for mag, sr in stream_stft(path, nfft, hop):
-        onset.append(dsp.spectral_flux(mag, prev))
+        if prev is None:
+            onset.append(0.0)
+        else:
+            onset.append(dsp.spectral_flux(mag, prev))
         prev = mag
+    # The first frame has no predecessor: prepend its zero transition so that
+    # onset[i] keeps indexing STFT frame i (centre i*hop).  The rise at an
+    # attack is shared between two analysis frames, so the spectral-flux peak
+    # leads the physical onset by ~hop/2; centering the envelope by half a hop
+    # (see the +0.5 frame offset applied to all output times below) removes
+    # that constant early bias regardless of tempo or where the attack falls
+    # on the hop grid.
 
     frame_rate = sr / hop
-    # Normalise the onset envelope.
+    # Normalise the onset envelope for visualisation only; the tracker works
+    # on the raw values and derives its thresholds from local statistics.
     mx = max(onset) if onset else 1.0
-    if mx > 1e-9:
-        onset = [v / mx for v in onset]
+    norm_onset = [v / mx for v in onset] if mx > 1e-9 else list(onset)
 
-    tempo = dsp.estimate_tempo(onset, frame_rate, min_bpm, max_bpm)
-    beats = dsp.detect_beats(onset, frame_rate, tempo)
-    times = [i / frame_rate for i in range(len(onset))]
-
-    # Onset peaks (for visualisation).
-    peaks = dsp.local_maxima(dsp.smooth(onset, 5))
+    tempo, beat_frames, peak_frames = dsp.track_beats(onset, frame_rate,
+                                                      min_bpm, max_bpm)
+    # Flux index i belongs to STFT frame i; centering by +half a hop places
+    # the rise at the physical onset (it is shared across two analysis
+    # frames), independent of tempo or crop position.
+    times = [(i + 0.5) / frame_rate for i in range(len(onset))]
 
     return {
         "sr": sr,
         "tempo": round(tempo, 2),
         "times": times,
-        "onset": onset,
-        "onset_peaks": [times[p] for p in peaks],
-        "beats": beats,
+        "onset": norm_onset,
+        "onset_peaks": [(p + 0.5) / frame_rate for p in peak_frames],
+        "beats": [(b + 0.5) / frame_rate for b in beat_frames],
     }
 
 

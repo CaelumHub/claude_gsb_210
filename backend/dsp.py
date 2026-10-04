@@ -706,66 +706,361 @@ def local_maxima(x: Sequence[float]) -> List[int]:
     return peaks
 
 
-def estimate_tempo(onset_env: Sequence[float], frame_rate: float,
-                   min_bpm: float = 40.0, max_bpm: float = 240.0) -> float:
-    """Estimate tempo (BPM) via autocorrelation of the onset envelope."""
-    n = len(onset_env)
-    if n < 8:
-        return 120.0
-    acorr = autocorrelation(onset_env)
-    min_lag = max(1, int(frame_rate * 60.0 / max_bpm))
-    max_lag = min(n - 1, int(frame_rate * 60.0 / min_bpm))
-    if min_lag >= max_lag:
-        return 120.0
-    best_lag, best_val = min_lag, -1e18
-    for lag in range(min_lag, max_lag + 1):
-        if acorr[lag] > best_val:
-            best_val, best_lag = acorr[lag], lag
-    return 60.0 * frame_rate / best_lag
-
-
 def smooth(x: Sequence[float], width: int = 3) -> List[float]:
-    """Moving-average smoothing of a 1-D sequence."""
-    if width < 1:
+    """Zero-phase centered moving-average smoothing of a 1-D sequence.
+
+    Edge samples are replicated so the window stays symmetric at both ends;
+    the output therefore has *no* group delay and does not depend on where a
+    crop starts or ends (a leading-only window at the head and a frozen tail
+    would otherwise shift peaks by several frames).
+    """
+    if width < 1 or not x:
         return list(x)
+    w = width if width % 2 == 1 else width + 1  # odd length -> symmetric
     n = len(x)
-    out = []
-    half = width // 2
-    acc = sum(x[:width])
+    half = w // 2
+    ext = [x[0]] * half + list(x) + [x[-1]] * half
+    acc = sum(ext[:w])
+    out = [0.0] * n
     for i in range(n):
-        out.append(acc / width)
-        if i - half >= 0 and i + half + 1 < n:
-            acc += x[i + half + 1] - x[i - half]
+        out[i] = acc / w
+        if i < n - 1:
+            acc += ext[i + w] - ext[i]
     return out
 
 
-def detect_beats(onset_env: Sequence[float], frame_rate: float, tempo: Optional[float] = None) -> List[float]:
-    """Beat times (s) via onset-envelope peak picking guided by the tempo."""
-    n = len(onset_env)
+def weighted_smooth(x: Sequence[float], kernel: Sequence[float]) -> List[float]:
+    """Zero-phase FIR smoothing with an arbitrary (symmetric) kernel.
+
+    Edge samples are replicated; the kernel is normalised to sum 1 internally.
+    """
+    n = len(x)
+    if n == 0 or not kernel:
+        return list(x)
+    ks = sum(kernel) or 1.0
+    half = len(kernel) // 2
+    ext = [x[0]] * half + list(x) + [x[-1]] * half
+    out = [0.0] * n
+    for i in range(n):
+        s = 0.0
+        for j, kv in enumerate(kernel):
+            s += kv * ext[i + j]
+        out[i] = s / ks
+    return out
+
+
+def frac_index(x: Sequence[float], pos: float) -> float:
+    """Linearly interpolated sample at fractional index ``pos`` (clamped)."""
+    n = len(x)
     if n == 0:
+        return 0.0
+    if pos <= 0:
+        return x[0]
+    if pos >= n - 1:
+        return x[-1]
+    i = int(pos)
+    f = pos - i
+    return x[i] * (1.0 - f) + x[i + 1] * f
+
+
+def _parabolic_shift(y0: float, y1: float, y2: float) -> float:
+    """Sub-bin offset of a parabola fitted through three samples (|.| < 1)."""
+    denom = y0 - 2.0 * y1 + y2
+    if denom <= 1e-15:
+        return 0.0
+    delta = 0.5 * (y0 - y2) / denom
+    if abs(delta) >= 1.0:
+        return 0.0
+    return delta
+
+
+def estimate_tempo(onset_env: Sequence[float], frame_rate: float,
+                   min_bpm: float = 40.0, max_bpm: float = 240.0) -> float:
+    """Estimate tempo (BPM) from an onset envelope.
+
+    The envelope is autocorrelated over the plausible lag range; the best lag
+    and the neighbouring lags are scored directly against the envelope peaks,
+    which resolves the usual octave (half/double-time) ambiguities without a
+    hard tempo prior.  The winning lag is sub-frame refined, so the BPM no
+    longer moves when the clip is shortened: a fractional lag is returned
+    instead of an integer one.
+    """
+    tempo, _beats, _peaks = track_beats(onset_env, frame_rate, min_bpm, max_bpm)
+    return tempo
+
+
+def _refine_peak(onset_env: Sequence[float], sm: Sequence[float], i: int) -> float:
+    """Crop-invariant sub-frame location of an onset straddling frame ``i``.
+
+    A physical attack splits its spectral-flux energy between the *two*
+    analysis frames it falls between; the split ratio depends on where the
+    attack lands relative to the hop grid, so neither the integer peak nor a
+    parabola on the smoothed envelope gives the same answer for a clip and a
+    crop of the same audio.  The flux centroid over the three frames around
+    the peak does: shifting the hop grid redistributes energy between adjacent
+    frames but leaves their centroid at the physical attack time.
+    """
+    n = len(onset_env)
+    # Work on the raw flux, background-subtracted with the smoothed envelope.
+    i0, i1 = max(0, i - 1), min(n - 1, i + 1)
+    vals = [max(0.0, onset_env[j] - 0.5 * sm[j]) for j in range(i0, i1 + 1)]
+    total = sum(vals)
+    if total <= 1e-12:
+        return float(i)
+    centre = sum(j * v for j, v in zip(range(i0, i1 + 1), vals)) / total
+    # Guard against a real secondary onset next door pulling the centroid.
+    if abs(centre - i) > 1.0:
+        return float(i) + _parabolic_shift(sm[i - 1], sm[i], sm[i + 1])
+    return centre
+
+
+def _onset_peaks(onset_env: Sequence[float], frame_rate: float,
+                 min_gap_sec: float = 0.03) -> List[Tuple[float, float]]:
+    """Onset peaks as ``(fractional_frame, strength)``.
+
+    A short *zero-phase* filter ([1,2,1]/4) suppresses one-frame jitter; the
+    adaptive threshold is a centered local average, so peak times carry no
+    systematic delay and do not move when the clip boundaries move.  Peak
+    locations are sub-frame refined with a flux centroid (see
+    :func:`_refine_peak`) which is invariant to the attack's position on the
+    hop grid and hence to trimming.
+    """
+    n = len(onset_env)
+    if n < 3:
         return []
-    if tempo is None:
-        tempo = estimate_tempo(onset_env, frame_rate)
-    period = max(1, int(round(frame_rate * 60.0 / tempo)))
-    sm = smooth(onset_env, max(3, period // 2))
-    peaks = local_maxima(sm)
+    sm = weighted_smooth(onset_env, (1.0, 2.0, 1.0))
+    win = max(7, int(round(frame_rate * 0.2)) | 1)  # ~200 ms local window
+    local = smooth(sm, win)
+    floor = max(sm) * 0.05
+    min_dist = max(1, int(round(frame_rate * min_gap_sec)))
+
+    raw: List[Tuple[int, float]] = []
+    for i in range(1, n - 1):
+        if sm[i] > sm[i - 1] and sm[i] >= sm[i + 1] and sm[i] > local[i] * 1.25 + floor:
+            raw.append((i, sm[i]))
+
+    # Enforce the minimum gap, keeping the stronger peak (non-max suppression).
+    raw.sort(key=lambda p: p[1], reverse=True)
+    kept: List[Tuple[int, float]] = []
+    for idx, val in raw:
+        if all(abs(idx - j) >= min_dist for j, _ in kept):
+            kept.append((idx, val))
+    kept.sort()
+
+    peaks: List[Tuple[float, float]] = []
+    for idx, val in kept:
+        pos = _refine_peak(onset_env, sm, idx)
+        peaks.append((pos, frac_index(sm, pos)))
+    return peaks
+
+
+def _tempo_lag_candidates(onset_env: Sequence[float], frame_rate: float,
+                          min_bpm: float, max_bpm: float) -> List[float]:
+    """Fractional beat-period candidates (frames): autocorrelation peaks + octaves."""
+    n = len(onset_env)
+    mean = sum(onset_env) / n
+    # Edge taper so the autocorrelation reflects content periodicity rather
+    # than where the crop happens to start/end.
+    taper_n = min(n // 4, max(2, int(frame_rate * 0.3)))
+    win = hann(2 * taper_n + 1)
+    y = []
+    for i, v in enumerate(onset_env):
+        w = 1.0
+        if i < taper_n:
+            w = win[i]
+        elif i > n - 1 - taper_n:
+            w = win[2 * taper_n - (n - 1 - i)]
+        y.append((v - mean) * w)
+
+    acorr = autocorrelation(y)
+    min_lag = max(1, int(frame_rate * 60.0 / max_bpm))
+    max_lag = min(n - 2, int(frame_rate * 60.0 / min_bpm))
+    if min_lag >= max_lag:
+        return []
+
+    # Unbiased normalisation (raw autocorrelation is biased toward short lags).
+    norm = [a / (n - lag) for lag, a in enumerate(acorr)]
+
+    # Top autocorrelation maxima in the valid lag window.
+    peak_lags = [lag for lag in range(min_lag + 1, max_lag)
+                 if norm[lag] > norm[lag - 1] and norm[lag] >= norm[lag + 1]]
+    peak_lags.sort(key=lambda lag: norm[lag], reverse=True)
+    seed_lags = peak_lags[:5] or [max(range(min_lag, max_lag + 1),
+                                     key=lambda lag: norm[lag])]
+
+    def refine(lag: int) -> float:
+        shift = _parabolic_shift(norm[lag - 1], norm[lag], norm[lag + 1])
+        return lag + shift
+
+    candidates = [refine(lag) for lag in seed_lags]
+    # Half/double-time alternatives of the global best.
+    best = refine(seed_lags[0])
+    if 2 * best <= max_lag:
+        candidates.append(2 * best)
+    if 0.5 * best >= min_lag:
+        candidates.append(0.5 * best)
+
+    # Keep valid, deduplicate periods within 2 %.
+    out: List[float] = []
+    for tau in candidates:
+        bpm = 60.0 * frame_rate / tau
+        if not (min_bpm <= bpm <= max_bpm):
+            continue
+        if all(abs(tau - t) / t > 0.02 for t in out):
+            out.append(tau)
+    return out
+
+
+def _grid_score(peaks: Sequence[Tuple[float, float]], n: int,
+                tau: float, phi: float, sigma: float) -> float:
+    """Score an event grid ``phi + k*tau`` against onset peaks.
+
+    Each peak contributes a Gaussian weight by distance to its nearest grid
+    line (distance wraps around the period); the sum is divided by the number
+    of grid lines in the clip, so half-time grids (empty lines every other
+    beat) and double-time grids (one line per two beats) are both penalised
+    symmetrically.  Peak coverage multiplies the score so spurious extra peaks
+    do not change the chosen phase.
+    """
+    if not peaks or tau <= 0 or phi >= n:
+        return 0.0
+    span = 3.0 * sigma
+    weighted = 0.0
+    matched = 0
+    for pos, strength in peaks:
+        d = (pos - phi) % tau
+        if d > tau / 2.0:
+            d -= tau
+        ad = abs(d)
+        if ad < span:
+            weighted += strength * math.exp(-0.5 * (d / sigma) ** 2)
+            if ad < 2.0 * sigma:
+                matched += 1
+    n_lines = 1 + int((n - 1 - phi) / tau)
+    return (weighted / max(1, n_lines)) * (matched / len(peaks))
+
+
+def _best_phase(peaks: Sequence[Tuple[float, float]], n: int,
+                tau: float, sigma: float) -> Tuple[float, float]:
+    """Best grid phase (fractional frames) and its score for a fixed period."""
+    tau_i = max(1, int(round(tau)))
+    best_phi, best_score = 0, -1.0
+    for phi in range(min(tau_i, n)):
+        s = _grid_score(peaks, n, tau, phi, sigma)
+        if s > best_score:
+            best_score, best_phi = s, phi
+    # Sub-frame phase refinement.
+    s0 = _grid_score(peaks, n, tau, best_phi - 1, sigma)
+    s2 = _grid_score(peaks, n, tau, best_phi + 1, sigma)
+    return best_phi + _parabolic_shift(s0, best_score, s2), best_score
+
+
+def track_beats(onset_env: Sequence[float], frame_rate: float,
+                min_bpm: float = 40.0, max_bpm: float = 240.0
+                ) -> Tuple[float, List[float], List[float]]:
+    """Full beat tracker: ``(tempo_bpm, beat_frames, peak_frames)``.
+
+    Pipeline: onset peaks -> autocorrelation period candidates with half/
+    double-time alternatives -> direct grid-vs-peak scoring to choose tempo
+    and phase -> snap every grid line onto the nearest actual onset peak with
+    sub-frame interpolation.  Nothing here depends on clip length or on where
+    the crop starts, and the only smoothing is zero-phase, so beat times line
+    up with the physical accents regardless of trimming.
+    """
+    n = len(onset_env)
+    if n < 8 or frame_rate <= 0:
+        return 120.0, [], []
+
+    peaks = _onset_peaks(onset_env, frame_rate)
     if not peaks:
-        return []
-    # Threshold relative to local average.
-    mean = sum(sm) / max(1, n)
-    thresh = mean * 1.3
-    candidates = [p for p in peaks if sm[p] > thresh]
+        return 120.0, [], []
+
+    pmax = max(s for _, s in peaks)
+    peaks_n = [(p, s / pmax) for p, s in peaks]
+    sigma = max(2.0, frame_rate * 0.022)  # ~22 ms alignment tolerance
+
+    candidates = _tempo_lag_candidates(onset_env, frame_rate, min_bpm, max_bpm)
     if not candidates:
-        candidates = peaks
-    # Greedy pick with a minimum spacing of half a beat period.
-    beats = []
-    last = -10 ** 9
-    min_gap = max(1, period // 2)
-    for p in candidates:
-        if p - last >= min_gap and sm[p] > 0:
-            beats.append(p)
-            last = p
-    return [b / frame_rate for b in beats]
+        return 120.0, [], []
+
+    best = (-1.0, 0.0, 0.0)  # (score, tau, phi)
+    for tau0 in candidates:
+        phi, score = _best_phase(peaks_n, n, tau0, sigma)
+        # Fine tempo search (+-2 %) with the phase re-optimised at each step.
+        for step in range(-5, 6):
+            tau = tau0 * (1.0 + 0.004 * step)
+            bpm = 60.0 * frame_rate / tau
+            if not (min_bpm <= bpm <= max_bpm):
+                continue
+            phi2, score2 = _best_phase(peaks_n, n, tau, sigma)
+            if score2 > best[0]:
+                best = (score2, tau, phi2)
+
+    _score, tau, phi = best
+    tempo = 60.0 * frame_rate / tau
+
+    # Lay the grid down and snap each line to the nearest real accent.
+    positions = [p for p, _ in peaks]
+    strengths = [s for _, s in peaks_n]
+    snap_radius = min(tau * 0.25, frame_rate * 0.14)
+    snap_sigma = max(2.0, frame_rate * 0.025)
+    level = smooth(onset_env, max(5, int(round(frame_rate * 0.09)) | 1))
+    mean_level = sum(level) / n
+
+    beat_frames: List[float] = []
+    k = 0
+    while True:
+        t = phi + k * tau
+        if t >= n:
+            break
+        if t >= 0:
+            # Binary search for the nearest peak.
+            lo, hi = 0, len(positions)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if positions[mid] < t:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            pick, pick_w = -1, 0.0
+            for j in (lo - 1, lo):
+                if 0 <= j < len(positions):
+                    d = abs(positions[j] - t)
+                    if d <= snap_radius:
+                        w = strengths[j] * math.exp(-0.5 * (d / snap_sigma) ** 2)
+                        if w > pick_w:
+                            pick_w, pick = w, j
+            if pick >= 0:
+                beat_frames.append(positions[pick])
+            elif frac_index(level, t) > mean_level * 0.5:
+                # Weak/legato beat: trust the grid rather than inventing a peak.
+                beat_frames.append(t)
+            # else: long rest / silence at the boundary -> no beat.
+        k += 1
+
+    beat_frames.sort()
+    return tempo, beat_frames, [p for p, _ in peaks]
+
+
+def detect_beats(onset_env: Sequence[float], frame_rate: float,
+                 tempo: Optional[float] = None) -> List[float]:
+    """Beat times (s) aligned to onset accents.
+
+    When ``tempo`` is given, the search is narrowed to a +-12 % band around
+    it; the phase is always derived from the actual onset peaks, so the
+    returned times sit on the accents and do not drift with clip length or
+    crop offset.
+    """
+    n = len(onset_env)
+    if n < 8 or frame_rate <= 0:
+        return []
+    if tempo and tempo > 0:
+        min_bpm, max_bpm = tempo * 0.88, tempo * 1.12
+    else:
+        min_bpm, max_bpm = 40.0, 240.0
+    _tempo, beat_frames, _peaks = track_beats(onset_env, frame_rate,
+                                              min_bpm, max_bpm)
+    return [b / frame_rate for b in beat_frames]
 
 
 # --------------------------------------------------------------------------- #
